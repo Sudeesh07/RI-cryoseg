@@ -1,0 +1,9 @@
+*dataset/
+*logs_laptop/
+*.claude/
+*checkpoints_laptop/
+*__pycache__/
+
+*.log
+papers/
+venv/

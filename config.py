@@ -1,0 +1,257 @@
+"""
+Configuration for SO(3)-Equivariant Protein Centroid Detection in Cryo-ET.
+
+Architecture: e3nn-based equivariant 3D U-Net with invariant scalar output head.
+Task: Detect centroids of 6 protein classes in CZII cryo-ET tomograms.
+Dataset: CryoET Object Identification Challenge — dataset ID 10440
+
+Protein classes (exact names from dataset annotation files):
+    ferritin_complex, beta_amylase, beta_galactosidase,
+    cytosolic_ribosome, thyroglobulin, pp7_vlp
+
+Coordinate convention:
+    Tomograms are stored as (D, H, W) = (z, y, x) in numpy/MRC/zarr.
+    Annotation ndjson files store coordinates as {"x": float, "y": float, "z": float}
+    in VOXEL units at the given VoxelSpacing resolution.
+    Loading: coords[z, y, x] = [loc["z"], loc["y"], loc["x"]].
+
+Protein size references:
+    ferritin_complex  : EMD-41923 — apo-ferritin, ~120 Å outer diameter
+    beta_amylase      : EMD-30405 — tetrameric, ~75 Å diameter
+    beta_galactosidase: EMD-0153  — tetrameric, ~160 Å diameter
+    cytosolic_ribosome: EMD-3883  — 80S, ~250–300 Å diameter
+    thyroglobulin     : EMD-24181 — homodimer, elongated ~180 Å mean diameter
+    pp7_vlp           : EMD-41917 — icosahedral VLP, ~270 Å diameter
+"""
+
+from dataclasses import dataclass, field
+from typing import Dict, List, Tuple, Optional
+from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# Protein class definitions
+# ---------------------------------------------------------------------------
+PROTEIN_CLASSES: Dict[str, dict] = {
+    "ferritin_complex": {
+        "id": 0,
+        "radius_angstrom": 60.0,    # apo-ferritin outer shell, ~120 Å diameter
+        "sigma_voxels": 2.5,        # Gaussian heatmap sigma at 10 Å/voxel
+        "weight": 1.0,
+        "color": (1.0, 0.0, 0.0),
+    },
+    "beta_amylase": {
+        "id": 1,
+        "radius_angstrom": 37.0,    # ~75 Å diameter — smallest particle
+        "sigma_voxels": 1.5,        # tight sigma for small particle
+        "weight": 2.0,              # downweighted relative to size → harder
+        "color": (0.0, 0.8, 0.0),
+    },
+    "beta_galactosidase": {
+        "id": 2,
+        "radius_angstrom": 80.0,    # tetrameric, ~160 Å diameter
+        "sigma_voxels": 3.5,
+        "weight": 1.5,
+        "color": (0.0, 0.0, 1.0),
+    },
+    "cytosolic_ribosome": {
+        "id": 3,
+        "radius_angstrom": 130.0,   # 80S ribosome, ~250–300 Å diameter
+        "sigma_voxels": 6.0,
+        "weight": 1.0,
+        "color": (1.0, 1.0, 0.0),
+    },
+    "thyroglobulin": {
+        "id": 4,
+        "radius_angstrom": 90.0,    # homodimer, elongated — mean radius
+        "sigma_voxels": 4.0,
+        "weight": 2.0,              # elongated shape makes Gaussian harder to fit
+        "color": (0.0, 1.0, 1.0),
+    },
+    "pp7_vlp": {
+        "id": 5,
+        "radius_angstrom": 135.0,   # icosahedral VLP, ~270 Å diameter
+        "sigma_voxels": 6.0,
+        "weight": 1.0,
+        "color": (1.0, 0.0, 1.0),
+    },
+}
+
+NUM_CLASSES = len(PROTEIN_CLASSES)          # 6
+CLASS_NAMES = list(PROTEIN_CLASSES.keys())
+CLASS_WEIGHTS = [PROTEIN_CLASSES[c]["weight"] for c in CLASS_NAMES]
+# Radius in voxels at 10 Å/voxel
+CLASS_RADII_VOXELS = [PROTEIN_CLASSES[c]["radius_angstrom"] / 10.0 for c in CLASS_NAMES]
+# Per-class Gaussian sigma for heatmap generation (in voxels)
+CLASS_SIGMAS_VOXELS = [PROTEIN_CLASSES[c]["sigma_voxels"] for c in CLASS_NAMES]
+
+# Maps annotation subdirectory IDs (from dataset 10440) to class names.
+# Directory 106 (membrane) is a segmentation mask — not a point annotation.
+ANNOTATION_DIR_TO_CLASS: Dict[str, str] = {
+    "100": "ferritin_complex",
+    "101": "beta_amylase",
+    "102": "beta_galactosidase",
+    "103": "cytosolic_ribosome",
+    "104": "thyroglobulin",
+    "105": "pp7_vlp",
+}
+
+# Voxel spacing of the primary reconstructions used for training
+PRIMARY_VOXEL_SPACING: float = 10.012   # Å/voxel
+
+
+@dataclass
+class DataConfig:
+    """Dataset and preprocessing configuration."""
+    # Root directory of the downloaded CryoET portal dataset
+    dataset_dir: str = "./dataset/10440"
+    # Subdirectory name under each run's Reconstructions folder
+    voxel_spacing_dir: str = "VoxelSpacing10.012"
+
+    # Tomogram properties
+    voxel_spacing: float = 10.012       # Å/voxel
+
+    # Patch extraction
+    patch_size: Tuple[int, int, int] = (96, 96, 96)
+    patches_per_tomo: int = 64          # patches sampled per tomogram per epoch
+    positive_patch_ratio: float = 0.7   # fraction of patches centered near a particle
+
+    # Gaussian heatmap targets — per-class sigmas are in CLASS_SIGMAS_VOXELS;
+    # gaussian_sigma is used only as a per-class fallback if not overridden.
+    gaussian_sigma: float = 4.0         # voxels (fallback)
+    gaussian_truncate: float = 3.0      # truncate Gaussian at this many sigmas
+    # Anisotropic z-axis sigma scaling to account for missing-wedge PSF elongation.
+    # sigma_z = sigma_xy * z_sigma_scale. Set to 1.0 for isotropic (so3 variant).
+    # Typical missing-wedge elongation factor: 1.5–2.0 at ±60° tilt range.
+    z_sigma_scale: float = 1.5
+
+    # Normalization
+    clip_percentile: Tuple[float, float] = (0.5, 99.5)
+    normalize: bool = True
+
+    # Augmentation
+    random_flip: bool = True
+    random_noise_std: float = 0.05
+    random_contrast: Tuple[float, float] = (0.9, 1.1)
+
+    # Run names reserved for validation (excluded from training)
+    val_run_names: Tuple[str, ...] = ("TS_99_9",)
+
+
+@dataclass
+class ModelConfig:
+    """SO(3)-equivariant U-Net model configuration."""
+    in_channels: int = 1                 # single density channel
+    num_classes: int = NUM_CLASSES       # 6 protein types
+
+    # Irrep specifications for each level.
+    # Format: "Ns x 0e + Nv x 1o + Nt x 2e"
+    # 0e = even scalar, 1o = odd vector, 2e = even rank-2 tensor.
+    encoder_irreps: List[str] = field(default_factory=lambda: [
+        "32x0e + 16x1o + 8x2e",    # level 0 — full resolution
+        "48x0e + 24x1o + 12x2e",   # level 1
+        "64x0e + 32x1o + 16x2e",   # level 2
+        "96x0e + 48x1o + 24x2e",   # level 3 — bottleneck
+    ])
+    decoder_irreps: List[str] = field(default_factory=lambda: [
+        "64x0e + 32x1o + 16x2e",   # level 2
+        "48x0e + 24x1o + 12x2e",   # level 1
+        "32x0e + 16x1o + 8x2e",    # level 0
+    ])
+
+    kernel_size: int = 5                 # 5×5×5 equivariant kernels
+    lmax: int = 2                        # max spherical harmonics degree
+    num_radial_basis: int = 8            # Gaussian radial basis count
+
+    activation: str = "gated"           # "gated" or "norm"
+    use_batch_norm: bool = True
+
+    pool_type: str = "avg"              # "avg" only (max-pool breaks equivariance)
+
+    # Architecture variant — controls which symmetry group is enforced:
+    #   "so3"       : full SO(3) equivariance, isotropic kernel (default)
+    #   "so3_aniso" : full SO(3) equivariance + anisotropic z heatmap targets
+    #   "so2"       : SO(2) equivariance (z-axis only) + anisotropic z targets
+    # "so3_aniso" and "so2" both require z_sigma_scale > 1.0 in DataConfig.
+    model_variant: str = "so3"
+
+
+@dataclass
+class TrainConfig:
+    """Training configuration."""
+    epochs: int = 200
+    batch_size: int = 2
+    learning_rate: float = 1e-3
+    weight_decay: float = 1e-5
+    lr_scheduler: str = "cosine"        # "cosine" or "step"
+    warmup_epochs: int = 5
+
+    loss_type: str = "combined"         # "wmse", "focal", "combined"
+    focal_alpha: float = 2.0
+    focal_gamma: float = 4.0
+    wmse_alpha: float = 0.1             # background weight in weighted MSE
+    loss_class_weights: bool = True
+
+    use_amp: bool = True
+
+    checkpoint_dir: str = "./checkpoints"
+    save_every: int = 10
+    log_dir: str = "./logs"
+
+    val_every: int = 5
+    val_patch_overlap: float = 0.25
+
+    seed: int = 42
+    num_workers: int = 4
+
+
+@dataclass
+class InferenceConfig:
+    """Inference and post-processing configuration."""
+    patch_size: Tuple[int, int, int] = (96, 96, 96)
+    overlap: float = 0.5
+
+    # Per-class NMS kernel sizes (must be odd).
+    # Kernel ≈ 2 × floor(radius_voxels) + 1 so that two particles whose
+    # centroids are closer than one diameter are suppressed to one detection.
+    # Computed at 10 Å/voxel from CLASS_RADII_VOXELS:
+    #   ferritin_complex    : r=6  → 13
+    #   beta_amylase        : r=3.7→  9
+    #   beta_galactosidase  : r=8  → 17
+    #   cytosolic_ribosome  : r=13 → 27
+    #   thyroglobulin       : r=9  → 19
+    #   pp7_vlp             : r=13.5→ 29
+    nms_kernel_sizes: Dict[str, int] = field(default_factory=lambda: {
+        "ferritin_complex":    13,
+        "beta_amylase":         9,
+        "beta_galactosidase":  17,
+        "cytosolic_ribosome":  27,
+        "thyroglobulin":       19,
+        "pp7_vlp":             29,
+    })
+    # Legacy single kernel — kept for callers that pass a flat int.
+    nms_kernel_size: int = 7
+
+    score_thresholds: Dict[str, float] = field(default_factory=lambda: {
+        "ferritin_complex": 0.3,
+        "beta_amylase": 0.2,
+        "beta_galactosidase": 0.3,
+        "cytosolic_ribosome": 0.3,
+        "thyroglobulin": 0.2,
+        "pp7_vlp": 0.3,
+    })
+
+    fbeta_beta: float = 4.0
+    distance_threshold_scale: float = 0.5  # match if dist < scale × radius_voxels
+
+    output_dir: str = "./predictions"
+    submission_csv: str = "./submission.csv"
+
+
+@dataclass
+class Config:
+    """Master configuration."""
+    data: DataConfig = field(default_factory=DataConfig)
+    model: ModelConfig = field(default_factory=ModelConfig)
+    train: TrainConfig = field(default_factory=TrainConfig)
+    inference: InferenceConfig = field(default_factory=InferenceConfig)
