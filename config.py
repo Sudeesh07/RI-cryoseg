@@ -163,7 +163,7 @@ class ModelConfig:
     lmax: int = 2                        # max spherical harmonics degree
     num_radial_basis: int = 8            # Gaussian radial basis count
 
-    activation: str = "gated"           # "gated" or "norm"
+    activation: str = "norm"           # "gated" or "norm"
     use_batch_norm: bool = True
 
     pool_type: str = "avg"              # "avg" only (max-pool breaks equivariance)
