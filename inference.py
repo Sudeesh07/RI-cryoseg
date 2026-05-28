@@ -108,6 +108,8 @@ def detect_proteins(
         heatmap,
         score_thresholds=cfg.score_thresholds,
         nms_kernel_sizes=getattr(cfg, "nms_kernel_sizes", None),
+        use_soft_nms=getattr(cfg, "use_soft_nms", False),
+        soft_nms_sigma_factor=getattr(cfg, "soft_nms_sigma_factor", 0.7),
     )
 
     # Print detection counts
@@ -169,12 +171,23 @@ def main():
     parser.add_argument("--output", type=str, default="./predictions", help="Output directory")
     parser.add_argument("--submission", type=str, default="submission.csv", help="Submission CSV path")
     parser.add_argument("--baseline", action="store_true", help="Use standard U-Net baseline")
-    parser.add_argument("--tta", action="store_true", help="Use rotation TTA")
+    parser.add_argument("--tta", action="store_true",
+                        help="Force enable rotation TTA (overrides cfg.inference.use_tta)")
+    parser.add_argument("--no-tta", action="store_true",
+                        help="Force disable rotation TTA (overrides cfg.inference.use_tta)")
+    parser.add_argument("--soft-nms", action="store_true",
+                        help="Use Gaussian Soft-NMS instead of hard NMS")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
     cfg = Config()
+    if args.soft_nms:
+        cfg.inference.use_soft_nms = True
+    if args.tta:
+        cfg.inference.use_tta = True
+    if args.no_tta:
+        cfg.inference.use_tta = False
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
 
@@ -213,8 +226,8 @@ def main():
         volume = normalize_tomogram(volume, cfg.data.clip_percentile)
         print(f"Volume shape: {volume.shape}")
 
-        # Predict
-        if args.tta:
+        # Predict — TTA when configured (or forced via --tta)
+        if inf_cfg.use_tta:
             heatmap = predict_with_rotation_tta(
                 model, volume, inf_cfg, device, args.batch_size,
                 cfg.train.use_amp,

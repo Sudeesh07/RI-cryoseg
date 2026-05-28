@@ -43,15 +43,22 @@ PROTEIN_CLASSES: Dict[str, dict] = {
     "beta_amylase": {
         "id": 1,
         "radius_angstrom": 37.0,    # ~75 Å diameter — smallest particle
-        "sigma_voxels": 1.5,        # tight sigma for small particle
-        "weight": 2.0,              # downweighted relative to size → harder
+        # sigma floored at 2.5 vox: a 1.5-vox Gaussian has too little support
+        # to survive 2x avg-pooling at the first encoder level.
+        "sigma_voxels": 2.5,
+        # CZII scoring metric assigns weight 0 to beta_amylase. Optimising it
+        # spends capacity on a class that does not affect the leaderboard.
+        # Kept at 0.1 (not 0) so the model still learns a representation but
+        # the loss gradient barely flows through it.
+        "weight": 0.1,
         "color": (0.0, 0.8, 0.0),
     },
     "beta_galactosidase": {
         "id": 2,
         "radius_angstrom": 80.0,    # tetrameric, ~160 Å diameter
         "sigma_voxels": 3.5,
-        "weight": 1.5,
+        # CZII weights this class at 2.0 (was 1.5 here, mismatched).
+        "weight": 2.0,
         "color": (0.0, 0.0, 1.0),
     },
     "cytosolic_ribosome": {
@@ -108,13 +115,32 @@ class DataConfig:
     # Subdirectory name under each run's Reconstructions folder
     voxel_spacing_dir: str = "VoxelSpacing10.012"
 
+    # Tomogram subdirectories to stack as input channels.
+    # The CZII dataset provides multiple reconstructions per run (denoised,
+    # wbp, ctfdeconvolved, isonet, denoiset). Stacking them as input channels
+    # is what every top CZII Kaggle solution did — it gives the network
+    # complementary views of the same density at no extra training cost.
+    # The default "100" is the denoised reconstruction. Set to a tuple to
+    # stack multiple, e.g. tomo_dirs=("100", "wbp", "ctfdeconvolved").
+    # Missing types are skipped gracefully so the same config works whether
+    # all variants exist on disk or only the denoised one.
+    tomo_dirs: Tuple[str, ...] = ("100",)
+
     # Tomogram properties
     voxel_spacing: float = 10.012       # Å/voxel
 
-    # Patch extraction
-    patch_size: Tuple[int, int, int] = (96, 96, 96)
+    # Patch extraction.
+    # patch_size is (D, H, W) = (z, y, x). The default (96, 128, 128) matches
+    # the tomogram aspect ratio (~184 x 630 x 630) better than cubic 96^3 —
+    # each patch captures more xy area where most particles are.
+    patch_size: Tuple[int, int, int] = (96, 128, 128)
     patches_per_tomo: int = 64          # patches sampled per tomogram per epoch
     positive_patch_ratio: float = 0.7   # fraction of patches centered near a particle
+    # Round-robin per-class positive sampling. When True, the i-th positive
+    # patch is centred on a random instance of class i % NUM_CLASSES, which
+    # guarantees uniform per-class coverage instead of over-sampling the
+    # most populous class (ribosomes).
+    balanced_class_sampling: bool = True
 
     # Gaussian heatmap targets — per-class sigmas are in CLASS_SIGMAS_VOXELS;
     # gaussian_sigma is used only as a per-class fallback if not overridden.
@@ -141,6 +167,14 @@ class DataConfig:
     random_flip: bool = True
     random_noise_std: float = 0.05
     random_contrast: Tuple[float, float] = (0.9, 1.1)
+
+    # Heavy MONAI-style augmentation pipeline (nnU-Net conventions:
+    # gamma, brightness, blur, low-resolution simulation, full-angle z-rotation).
+    # When True, the simple flip/contrast/noise pipeline above is replaced
+    # by the richer one in dataset._augment_patch_heavy.
+    # Required for the SegResNet baseline to learn approximate equivariance
+    # from data instead of from architectural constraints.
+    heavy_augmentation: bool = False
 
     # Run names reserved for validation (excluded from training)
     val_run_names: Tuple[str, ...] = ("TS_99_9",)
@@ -186,6 +220,13 @@ class ModelConfig:
     # targets (iso/aniso), letting you separate the two factors.
     model_variant: str = "so3"
 
+    # When use_equivariant=False, which non-equivariant baseline to build.
+    # "segresnet" (default) is the strong MONAI 3D ResNet-style baseline that
+    # CZII Kaggle top-5 solutions used; "unet3d" is the plain U-Net.
+    # The SegResNet baseline + heavy augmentation is the integrity check that
+    # decides whether the equivariant architecture is worth keeping.
+    baseline_arch: str = "segresnet"
+
 
 @dataclass
 class TrainConfig:
@@ -214,6 +255,19 @@ class TrainConfig:
     learnable_z_sigma_max: float = 4.0      # clamp upper bound
 
     use_amp: bool = True
+
+    # Exponential Moving Average of model weights — a near-free regulariser
+    # used by the 4th and 13th-place CZII solutions. Shadow weights updated
+    # as theta_ema = decay * theta_ema + (1 - decay) * theta, evaluated and
+    # checkpointed independently of the live model.
+    use_ema: bool = True
+    ema_decay: float = 0.999
+
+    # Deep supervision: attach auxiliary heads at decoder levels and sum
+    # losses with decreasing weights. nnU-Net default is [0.5, 0.25, 0.125]
+    # for the three coarser scales; the primary head keeps weight 1.0.
+    deep_supervision: bool = False
+    deep_supervision_weights: Tuple[float, ...] = (0.5, 0.25, 0.125)
 
     checkpoint_dir: str = "./checkpoints"
     save_every: int = 10
@@ -273,6 +327,17 @@ class InferenceConfig:
 
     fbeta_beta: float = 4.0
     distance_threshold_scale: float = 0.5  # match if dist < scale × radius_voxels
+
+    # Test-time augmentation: average predictions over 4 in-plane rotations
+    # (k * 90 degrees about z). Free F-beta lift for non-equivariant models;
+    # near-zero gain for SO(3) models (which is itself a useful sanity check).
+    use_tta: bool = False
+
+    # Soft-NMS: instead of zeroing all peaks within the NMS kernel, decay
+    # their scores by exp(-d^2 / (2 * sigma_nms^2)). Recovers recall on dense
+    # scenes (clustered ribosomes, adjacent VLPs). sigma_nms = factor * radius.
+    use_soft_nms: bool = False
+    soft_nms_sigma_factor: float = 0.7
 
     output_dir: str = "./predictions"
     submission_csv: str = "./submission.csv"

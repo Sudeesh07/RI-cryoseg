@@ -1,18 +1,32 @@
 """
 Training Pipeline for SO(3)/SO(2)-Equivariant Protein Centroid Detection.
 
-Supports four model variants (--model-variant) — a 2x2 ablation of
-architecture (so3 / so2) x targets (iso / aniso):
+Supports four equivariant variants — a 2x2 ablation of architecture
+(so3 / so2) x targets (iso / aniso):
   so3       — SO(3)-equivariant U-Net, isotropic heatmap targets
   so3_aniso — SO(3)-equivariant U-Net, anisotropic z heatmap targets
   so2       — SO(2)-equivariant U-Net, anisotropic z heatmap targets
   so2_iso   — SO(2)-equivariant U-Net, isotropic heatmap targets
 
+Plus a non-equivariant baseline (--baseline) — the Rank-0 integrity check:
+  --baseline                              # default arch: segresnet
+  --baseline --baseline-arch segresnet    # MONAI 3D SegResNet (recommended)
+  --baseline --baseline-arch unet3d       # plain 3D U-Net
+
+Recommended SegResNet-baseline command (matches the CZII Kaggle setup that
+beat equivariant networks empirically):
+  torchrun --nproc_per_node=2 train.py --baseline --heavy-aug \\
+      --tomo-dirs 100  # add more comma-separated dirs if available
+
+Other useful flags:
+  --learnable-z-sigma   per-class learnable z-Gaussian in the loss
+  --heavy-aug           MONAI-style augmentation (gamma/blur/low-res/...)
+  --no-ema              disable EMA shadow model (default: enabled)
+  --tomo-dirs DIRS      comma-separated tomogram subdirs to stack as channels
+
 Multi-GPU (2 GPUs):
-  torchrun --nproc_per_node=2 train.py --model-variant so3
-  torchrun --nproc_per_node=2 train.py --model-variant so3_aniso
   torchrun --nproc_per_node=2 train.py --model-variant so2
-  torchrun --nproc_per_node=2 train.py --model-variant so2_iso
+  torchrun --nproc_per_node=2 train.py --baseline --heavy-aug
 
 Single-GPU:
   python train.py --model-variant so3
@@ -36,12 +50,13 @@ import torch.nn as nn
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.amp import GradScaler, autocast
+from torch.optim.swa_utils import AveragedModel
 from torch.utils.tensorboard import SummaryWriter
 
 from config import Config, TrainConfig
 from dataset import (
     build_dataloaders,
-    load_tomogram, normalize_tomogram, get_tomogram_path,
+    load_tomogram_stack,
     load_run_annotations, discover_run_names,
     CZIIInferenceDataset,
 )
@@ -117,6 +132,23 @@ def set_seed(seed: int, rank: int = 0):
 # Optimizer / Scheduler
 # ---------------------------------------------------------------------------
 
+def build_ema_model(model: nn.Module, decay: float = 0.999) -> AveragedModel:
+    """Create an EMA (exponential moving average) shadow of `model`.
+
+    theta_ema = decay * theta_ema + (1 - decay) * theta, applied after every
+    optimizer step. The EMA weights typically generalise 0.5-1.5% better in
+    F-beta than the raw weights, and were used by the 4th and 13th-place
+    CZII Kaggle solutions. AveragedModel handles DDP-unwrapping internally.
+    """
+    inner = model.module if isinstance(model, DDP) else model
+
+    def _ema_fn(avg_param, param, num_averaged):
+        return decay * avg_param + (1.0 - decay) * param
+
+    ema = AveragedModel(inner, avg_fn=_ema_fn)
+    return ema
+
+
 def build_optimizer(
     model: nn.Module,
     cfg: TrainConfig,
@@ -173,7 +205,7 @@ def build_scheduler(optimizer, cfg: TrainConfig, steps_per_epoch: int):
 def train_one_epoch(
     model, loader, criterion, optimizer, scheduler,
     scaler, device, use_amp, epoch, rank, world_size,
-    writer=None,
+    writer=None, ema_model=None,
 ) -> dict:
     model.train()
     total_loss   = 0.0
@@ -204,6 +236,15 @@ def train_one_epoch(
 
         if scheduler is not None:
             scheduler.step()
+
+        # EMA update happens after the optimizer step so the shadow tracks
+        # the post-step parameters. AveragedModel takes the underlying module,
+        # but it was constructed from `model.module` if DDP — passing the live
+        # DDP-wrapped model would walk a different parameter tree, so unwrap.
+        if ema_model is not None:
+            ema_model.update_parameters(
+                model.module if isinstance(model, DDP) else model
+            )
 
         total_loss  += loss.item()
         total_gnorm += float(gnorm)
@@ -330,12 +371,17 @@ def validate_full_volume(
 
     for run_name in run_names:
         try:
-            tomo_path = get_tomogram_path(dataset_dir, run_name, data_cfg.voxel_spacing_dir)
+            # Load all configured tomogram channels (denoised / wbp / etc.)
+            volume = load_tomogram_stack(
+                dataset_dir=dataset_dir,
+                run_name=run_name,
+                voxel_spacing_dir=data_cfg.voxel_spacing_dir,
+                tomo_dirs=getattr(data_cfg, "tomo_dirs", ("100",)),
+                normalize=data_cfg.normalize,
+                clip_percentile=data_cfg.clip_percentile,
+            )
         except FileNotFoundError:
             continue
-        volume = load_tomogram(tomo_path)
-        if data_cfg.normalize:
-            volume = normalize_tomogram(volume, data_cfg.clip_percentile)
 
         ds = CZIIInferenceDataset(
             volume,
@@ -363,6 +409,8 @@ def validate_full_volume(
 
         pred_dets = extract_centroids(
             full_heatmap, score_thresholds, nms_kernel_sizes=nms_kernel_sizes,
+            use_soft_nms=getattr(inference_cfg, "use_soft_nms", False),
+            soft_nms_sigma_factor=getattr(inference_cfg, "soft_nms_sigma_factor", 0.7),
         )
         gt_dict = load_run_annotations(
             os.path.join(dataset_dir, run_name), data_cfg.voxel_spacing_dir,
@@ -402,13 +450,21 @@ def validate_full_volume(
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def save_checkpoint(model, optimizer, scheduler, scaler, epoch, metrics, path):
+def save_checkpoint(
+    model, optimizer, scheduler, scaler, epoch, metrics, path,
+    ema_model=None,
+):
     os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     # Unwrap DDP before saving so checkpoints load on any number of GPUs
     state_dict = model.module.state_dict() if isinstance(model, DDP) else model.state_dict()
+    ema_state = None
+    if ema_model is not None:
+        # AveragedModel stores the shadow as .module
+        ema_state = ema_model.module.state_dict()
     torch.save({
         "epoch":               epoch,
         "model_state_dict":    state_dict,
+        "ema_state_dict":      ema_state,
         "optimizer_state_dict": optimizer.state_dict(),
         "scheduler_state_dict": scheduler.state_dict() if scheduler else None,
         "scaler_state_dict":    scaler.state_dict() if scaler else None,
@@ -452,6 +508,23 @@ def main():
         ),
     )
     parser.add_argument(
+        "--no-ema", action="store_true",
+        help="Disable EMA shadow model (default: enabled)",
+    )
+    parser.add_argument(
+        "--heavy-aug", action="store_true",
+        help="Enable MONAI-style heavy augmentation (gamma/blur/low-res/...)",
+    )
+    parser.add_argument(
+        "--baseline-arch", type=str, default=None,
+        choices=["segresnet", "unet3d"],
+        help="When --baseline: which non-equivariant arch to build",
+    )
+    parser.add_argument(
+        "--tomo-dirs", type=str, default=None,
+        help="Comma-separated tomogram subdirs to stack as channels, e.g. '100,wbp,ctfdeconvolved'",
+    )
+    parser.add_argument(
         "--model-variant",
         type=str,
         default=None,
@@ -479,13 +552,19 @@ def main():
 
     # Apply model variant — also controls z_sigma_scale for anisotropic targets.
     # The 2x2 ablation: architecture (so3 / so2) x targets (iso / aniso).
-    variant = args.model_variant or ("baseline" if args.baseline else "so3")
-    if not args.baseline:
+    if args.baseline:
+        # Tag baseline checkpoints with the architecture so segresnet and
+        # unet3d don't collide. Default architecture is segresnet.
+        baseline_arch = args.baseline_arch or cfg.model.baseline_arch or "segresnet"
+        variant = f"baseline_{baseline_arch}"
+    else:
+        variant = args.model_variant or "so3"
         cfg.model.model_variant = variant
+
     if variant in ("so3_aniso", "so2"):
         cfg.data.z_sigma_scale = 1.5   # anisotropic z heatmap targets
     else:
-        # "so3" and "so2_iso" both use isotropic targets
+        # "so3", "so2_iso", and all baselines use isotropic targets
         cfg.data.z_sigma_scale = 1.0
 
     # Learnable per-class sigma_z overrides the static z_sigma_scale.
@@ -496,6 +575,22 @@ def main():
         cfg.data.target_mode = "xy_blur"
         # Tag the run so checkpoints/logs don't collide with the static variant.
         variant = f"{variant}_lz"
+
+    # CLI overrides for the new flags.
+    if args.no_ema:
+        cfg.train.use_ema = False
+    if args.heavy_aug:
+        cfg.data.heavy_augmentation = True
+    if args.baseline_arch is not None:
+        cfg.model.baseline_arch = args.baseline_arch
+    if args.tomo_dirs is not None:
+        cfg.data.tomo_dirs = tuple(
+            t.strip() for t in args.tomo_dirs.split(",") if t.strip()
+        )
+
+    # Keep ModelConfig.in_channels in sync with the number of stacked tomogram
+    # reconstructions. The dataset emits (C, D, H, W) where C == len(tomo_dirs).
+    cfg.model.in_channels = len(cfg.data.tomo_dirs)
 
     train_cfg = cfg.train
     set_seed(train_cfg.seed, rank)
@@ -542,7 +637,10 @@ def main():
     model = model.to(device)
 
     if is_ddp:
-        model = nn.SyncBatchNorm.convert_sync_batchnorm(model)
+        # No SyncBatchNorm: equivariant blocks use e3nn BatchNorm with
+        # instance=True (per-sample stats), and the SegResNet baseline
+        # uses InstanceNorm. Both are independent of DDP world size, so
+        # converting to SyncBN here would be a no-op or harmful.
         model = DDP(model, device_ids=[local_rank], find_unused_parameters=False)
 
     if is_main(rank):
@@ -555,6 +653,13 @@ def main():
     criterion = build_loss(train_cfg).to(device)
     extra_loss_modules = [criterion] if train_cfg.learnable_z_sigma else None
     optimizer = build_optimizer(model, train_cfg, extra_modules=extra_loss_modules)
+
+    # EMA shadow model (rank 0 only — only used for validation/checkpointing).
+    # Built BEFORE the first training step so it captures the init.
+    ema_model: Optional[AveragedModel] = None
+    if is_main(rank) and train_cfg.use_ema:
+        ema_model = build_ema_model(model, decay=train_cfg.ema_decay).to(device)
+        print(f"EMA shadow model enabled with decay={train_cfg.ema_decay}")
     scheduler = build_scheduler(optimizer, train_cfg, len(train_loader))
     scaler    = GradScaler("cuda", enabled=train_cfg.use_amp)
 
@@ -581,11 +686,12 @@ def main():
         if hasattr(train_loader.sampler, "set_epoch"):
             train_loader.sampler.set_epoch(epoch)
 
-        # Train
+        # Train (ema_model is rank-0 only; other ranks pass None)
         train_metrics = train_one_epoch(
             model, train_loader, criterion, optimizer, scheduler,
             scaler, device, train_cfg.use_amp, epoch, rank, world_size,
             writer=writer if is_main(rank) else None,
+            ema_model=ema_model,
         )
 
         if is_main(rank) and writer:
@@ -602,12 +708,14 @@ def main():
                         f"learnable_z_sigma/{cls_name}", float(z), epoch,
                     )
 
-        # Validate (only main process; val_loader has no sampler)
+        # Validate (only main process; val_loader has no sampler).
+        # Evaluate the EMA shadow when available — that is the deployment model.
         val_metrics = {}
         if val_loader and (epoch + 1) % train_cfg.val_every == 0:
             if is_main(rank):
+                eval_model = ema_model if ema_model is not None else model
                 val_metrics = validate(
-                    model, val_loader, criterion, device,
+                    eval_model, val_loader, criterion, device,
                     train_cfg.use_amp, score_thresholds,
                     world_size=1,
                     nms_kernel_sizes=nms_kernel_sizes,
@@ -622,6 +730,7 @@ def main():
                         model, optimizer, scheduler, scaler, epoch,
                         {**train_metrics, **val_metrics},
                         os.path.join(str(ckpt_base), "best.pt"),
+                        ema_model=ema_model,
                     )
 
         # Full-volume validation — sliding-window inference on each val run,
@@ -632,8 +741,9 @@ def main():
                 and (epoch + 1) % fv_every == 0):
             val_runs = list(cfg.data.val_run_names)
             t_fv = time.time()
+            fv_eval_model = ema_model if ema_model is not None else model
             fv_metrics = validate_full_volume(
-                model,
+                fv_eval_model,
                 dataset_dir=cfg.data.dataset_dir,
                 run_names=val_runs,
                 data_cfg=cfg.data,
@@ -661,6 +771,7 @@ def main():
                     model, optimizer, scheduler, scaler, epoch,
                     {**train_metrics, **val_metrics, **fv_metrics},
                     os.path.join(str(ckpt_base), "best.pt"),
+                    ema_model=ema_model,
                 )
 
         # Periodic checkpoint — rank 0 only
@@ -669,6 +780,7 @@ def main():
                 model, optimizer, scheduler, scaler, epoch,
                 {**train_metrics, **val_metrics},
                 os.path.join(str(ckpt_base), f"epoch_{epoch:04d}.pt"),
+                ema_model=ema_model,
             )
 
         if is_main(rank):
@@ -689,6 +801,7 @@ def main():
             model, optimizer, scheduler, scaler, train_cfg.epochs - 1,
             train_metrics,
             os.path.join(str(ckpt_base), "final.pt"),
+            ema_model=ema_model,
         )
         if writer:
             writer.close()

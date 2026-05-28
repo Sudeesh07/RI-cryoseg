@@ -204,6 +204,50 @@ def get_tomogram_path(
     raise FileNotFoundError(f"No tomogram found for run {run_name} in {tomo_root}")
 
 
+def load_tomogram_stack(
+    dataset_dir: Union[str, Path],
+    run_name: str,
+    voxel_spacing_dir: str,
+    tomo_dirs: Tuple[str, ...],
+    normalize: bool,
+    clip_percentile: Tuple[float, float],
+) -> np.ndarray:
+    """
+    Load and stack the requested tomogram reconstructions as input channels.
+
+    Missing reconstruction types are skipped silently (the same config works
+    whether all variants exist or only the denoised one). Always returns at
+    least one channel; raises if none of the requested types exist.
+
+    Returns: (C, D, H, W) float32 array.
+    """
+    channels: List[np.ndarray] = []
+    for tdir in tomo_dirs:
+        try:
+            path = get_tomogram_path(dataset_dir, run_name, voxel_spacing_dir, tomo_dir=tdir)
+        except FileNotFoundError:
+            continue
+        vol = load_tomogram(path)
+        if normalize:
+            vol = normalize_tomogram(vol, clip_percentile)
+        channels.append(vol)
+
+    if not channels:
+        raise FileNotFoundError(
+            f"None of the requested tomo_dirs={tomo_dirs} exist for run {run_name}"
+        )
+
+    # Sanity-check all channels have the same shape
+    ref_shape = channels[0].shape
+    for i, c in enumerate(channels[1:], start=1):
+        if c.shape != ref_shape:
+            raise ValueError(
+                f"Channel shape mismatch in {run_name}: tomo_dirs[{i}] "
+                f"has shape {c.shape}, expected {ref_shape}"
+            )
+    return np.stack(channels, axis=0).astype(np.float32)
+
+
 def discover_run_names(dataset_dir: Union[str, Path]) -> List[str]:
     """Return sorted list of run names (TS_* directories) in the dataset."""
     return sorted(
@@ -431,25 +475,33 @@ def extract_random_patch(
 # ---------------------------------------------------------------------------
 
 def augment_patch(
-    volume: np.ndarray,
-    heatmap: np.ndarray,
+    volume: np.ndarray,         # (C, D, H, W)
+    heatmap: np.ndarray,        # (C, D, H, W)
     cfg: DataConfig,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Apply random augmentations to a volume patch and its heatmap."""
-    # Random axis flips — only flip in-plane axes (1=y, 2=x).
-    # Flipping axis 0 (z / beam axis) is physically invalid for cryo-ET: it
+    """Apply random augmentations to a volume patch and its heatmap.
+
+    Both arrays are channel-first: volume axes (C, D, H, W) = (C, z, y, x);
+    heatmap axes (NumClasses, D, H, W) = (C, z, y, x). Spatial axes are
+    1=z, 2=y, 3=x for both arrays.
+    """
+    if getattr(cfg, "heavy_augmentation", False):
+        return _augment_patch_heavy(volume, heatmap, cfg)
+
+    # Random axis flips — only flip in-plane axes (y=2, x=3).
+    # Flipping axis 1 (z / beam axis) is physically invalid for cryo-ET: it
     # would reverse the beam direction and change the orientation of the missing
     # wedge, producing a distribution the model will never see during inference.
     if cfg.random_flip:
-        for axis in [1, 2]:
+        for axis in [2, 3]:
             if np.random.rand() > 0.5:
                 volume = np.flip(volume, axis=axis).copy()
-                heatmap = np.flip(heatmap, axis=axis + 1).copy()  # +1 for channel dim
+                heatmap = np.flip(heatmap, axis=axis).copy()
 
-    # Random 90° rotations in the XY plane (axis 1,2 of volume = y,x)
+    # Random 90° rotations in the XY plane (y, x = axes 2, 3)
     k = np.random.randint(4)
     if k > 0:
-        volume = np.rot90(volume, k=k, axes=(1, 2)).copy()
+        volume = np.rot90(volume, k=k, axes=(2, 3)).copy()
         heatmap = np.rot90(heatmap, k=k, axes=(2, 3)).copy()
 
     # Additive Gaussian noise
@@ -461,6 +513,136 @@ def augment_patch(
     volume = volume * np.random.uniform(lo, hi)
 
     return volume, heatmap
+
+
+# ---------------------------------------------------------------------------
+# Heavy MONAI-style augmentation pipeline (nnU-Net conventions)
+# ---------------------------------------------------------------------------
+
+def _augment_patch_heavy(
+    volume: np.ndarray,         # (C, D, H, W) float32
+    heatmap: np.ndarray,        # (C, D, H, W) float32
+    cfg: DataConfig,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Aggressive augmentation pipeline used by the SegResNet baseline and
+    other non-equivariant models. Forces the network to learn approximate
+    rotation invariance from data rather than from architectural constraints.
+
+    Pipeline (each step applied with its own probability):
+      1. xy flips (y, x axes)
+      2. 90 deg xy rotations (preserves missing wedge)
+      3. small random rotation about z (any angle in +/- 15 deg)
+      4. random rescale [0.85, 1.15] in xy
+      5. brightness shift, contrast scale, gamma correction
+      6. Gaussian noise
+      7. Gaussian blur with random sigma
+      8. low-resolution simulation (downsample + upsample)
+
+    Targets are transformed identically for spatial ops; intensity-only ops
+    skip the heatmap. All ops preserve the channel-first layout.
+    """
+    import scipy.ndimage as ndi
+
+    # --- spatial: flips ---
+    for axis in [2, 3]:
+        if np.random.rand() < 0.5:
+            volume = np.flip(volume, axis=axis).copy()
+            heatmap = np.flip(heatmap, axis=axis).copy()
+
+    # --- spatial: 90 deg xy rotation ---
+    k = np.random.randint(4)
+    if k > 0:
+        volume = np.rot90(volume, k=k, axes=(2, 3)).copy()
+        heatmap = np.rot90(heatmap, k=k, axes=(2, 3)).copy()
+
+    # --- spatial: small continuous z-rotation (preserves missing wedge) ---
+    if np.random.rand() < 0.5:
+        angle = float(np.random.uniform(-15.0, 15.0))
+        # Rotate each channel of (C, D, H, W) in the (H, W) plane (axes 2, 3)
+        volume = ndi.rotate(
+            volume, angle, axes=(2, 3), reshape=False, order=1, mode="nearest",
+        ).astype(np.float32)
+        heatmap = ndi.rotate(
+            heatmap, angle, axes=(2, 3), reshape=False, order=1, mode="nearest",
+        ).astype(np.float32)
+        heatmap = np.clip(heatmap, 0.0, 1.0)
+
+    # --- spatial: scale [0.85, 1.15] in xy (skip z so missing-wedge stays calibrated) ---
+    if np.random.rand() < 0.3:
+        scale = float(np.random.uniform(0.85, 1.15))
+        zoom_factors = (1.0, 1.0, scale, scale)
+        # zoom changes shape; crop/pad back to the original spatial size
+        original_shape = volume.shape
+        volume_zoomed = ndi.zoom(volume, zoom_factors, order=1)
+        heatmap_zoomed = ndi.zoom(heatmap, zoom_factors, order=1)
+        volume = _center_crop_or_pad(volume_zoomed, original_shape)
+        heatmap = _center_crop_or_pad(heatmap_zoomed, original_shape)
+        heatmap = np.clip(heatmap, 0.0, 1.0)
+
+    # --- intensity: brightness shift ---
+    if np.random.rand() < 0.3:
+        volume = volume + float(np.random.uniform(-0.1, 0.1))
+
+    # --- intensity: contrast scale ---
+    if np.random.rand() < 0.3:
+        scale = float(np.random.uniform(0.75, 1.25))
+        mean = volume.mean()
+        volume = (volume - mean) * scale + mean
+
+    # --- intensity: gamma correction (on per-channel min-max normalised) ---
+    if np.random.rand() < 0.3:
+        gamma = float(np.random.uniform(0.7, 1.5))
+        for c in range(volume.shape[0]):
+            ch = volume[c]
+            lo, hi = float(ch.min()), float(ch.max())
+            if hi > lo:
+                ch_norm = (ch - lo) / (hi - lo)
+                ch_norm = np.power(np.clip(ch_norm, 0.0, 1.0), gamma)
+                volume[c] = ch_norm * (hi - lo) + lo
+
+    # --- intensity: Gaussian noise ---
+    if np.random.rand() < 0.5 and cfg.random_noise_std > 0:
+        volume = volume + np.random.normal(
+            0, cfg.random_noise_std, volume.shape,
+        ).astype(np.float32)
+
+    # --- intensity: Gaussian blur (per-channel) ---
+    if np.random.rand() < 0.2:
+        sigma = float(np.random.uniform(0.5, 1.5))
+        for c in range(volume.shape[0]):
+            volume[c] = ndi.gaussian_filter(volume[c], sigma=sigma)
+
+    # --- intensity: low-resolution simulation (downsample + upsample) ---
+    if np.random.rand() < 0.2:
+        factor = float(np.random.uniform(0.5, 1.0))
+        zoom_down = (1.0, 1.0, factor, factor)
+        zoom_up = (1.0, 1.0, 1.0 / factor, 1.0 / factor)
+        downsampled = ndi.zoom(volume, zoom_down, order=1)
+        volume = ndi.zoom(downsampled, zoom_up, order=1).astype(np.float32)
+        volume = _center_crop_or_pad(volume, heatmap.shape)
+
+    return volume.astype(np.float32), heatmap.astype(np.float32)
+
+
+def _center_crop_or_pad(arr: np.ndarray, target_shape: Tuple[int, ...]) -> np.ndarray:
+    """Center-crop or zero-pad arr to target_shape on all matching axes."""
+    out = arr
+    for axis, target in enumerate(target_shape):
+        current = out.shape[axis]
+        if current == target:
+            continue
+        if current > target:
+            start = (current - target) // 2
+            sl = [slice(None)] * out.ndim
+            sl[axis] = slice(start, start + target)
+            out = out[tuple(sl)]
+        else:
+            pad_before = (target - current) // 2
+            pad_after = target - current - pad_before
+            pad_spec = [(0, 0)] * out.ndim
+            pad_spec[axis] = (pad_before, pad_after)
+            out = np.pad(out, pad_spec, mode="constant", constant_values=0)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -502,11 +684,19 @@ class CZIIDataset(Dataset):
 
         all_annotations = load_dataset_annotations(dataset_dir, cfg.voxel_spacing_dir)
 
+        tomo_dirs = getattr(cfg, "tomo_dirs", ("100",))
+
         for run_name in run_names:
-            tomo_path = get_tomogram_path(dataset_dir, run_name, cfg.voxel_spacing_dir)
-            vol = load_tomogram(tomo_path)
-            if cfg.normalize:
-                vol = normalize_tomogram(vol, cfg.clip_percentile)
+            # Multi-channel input: stack each requested reconstruction type
+            # along a new channel axis. Storage layout becomes (C, D, H, W).
+            vol = load_tomogram_stack(
+                dataset_dir=dataset_dir,
+                run_name=run_name,
+                voxel_spacing_dir=cfg.voxel_spacing_dir,
+                tomo_dirs=tomo_dirs,
+                normalize=cfg.normalize,
+                clip_percentile=cfg.clip_percentile,
+            )
             self.volumes[run_name] = vol
 
             annot = all_annotations.get(run_name, {})
@@ -572,24 +762,27 @@ class CZIIDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         run_name = self.run_names[idx % len(self.run_names)]
-        vol      = self.volumes[run_name]
+        vol      = self.volumes[run_name]   # (C, D, H, W) multi-channel
         annot    = self.annotations[run_name]
         centroids = self.all_centroids[run_name]
 
         patch_size = self.cfg.patch_size
+        # Pass the spatial shape (D, H, W) — vol.shape is (C, D, H, W)
         z0, y0, x0 = _sample_patch_origin(
-            vol.shape, patch_size,
+            vol.shape[1:], patch_size,
             centroids_all=centroids if self.is_train else None,
             positive_ratio=self.cfg.positive_patch_ratio if self.is_train else 0.0,
         )
         pd, ph, pw = patch_size
-        vol_patch = vol[z0:z0 + pd, y0:y0 + ph, x0:x0 + pw]
+        # Slice all input channels: (C, pd, ph, pw)
+        vol_patch = vol[:, z0:z0 + pd, y0:y0 + ph, x0:x0 + pw]
         hm_patch  = self._make_patch_heatmap(annot, (z0, y0, x0), patch_size)
 
         if self.is_train:
             vol_patch, hm_patch = augment_patch(vol_patch, hm_patch, self.cfg)
 
-        vol_tensor = torch.from_numpy(np.ascontiguousarray(vol_patch)).unsqueeze(0).float()
+        # vol_patch is already (C, D, H, W); model expects (B, C, D, H, W)
+        vol_tensor = torch.from_numpy(np.ascontiguousarray(vol_patch)).float()
         hm_tensor  = torch.from_numpy(np.ascontiguousarray(hm_patch)).float()
         return vol_tensor, hm_tensor
 
@@ -616,18 +809,28 @@ class CZIIInferenceDataset(Dataset):
     """
     Sliding-window dataset for full-tomogram inference.
 
+    Accepts either a single-channel (D, H, W) volume — promoted to (1, D, H, W) —
+    or a pre-stacked multi-channel (C, D, H, W) volume.
+
     Yields patches and their (z0, y0, x0) origins for later aggregation.
     """
 
     def __init__(
         self,
         volume: np.ndarray,
-        patch_size: Tuple[int, int, int] = (96, 96, 96),
+        patch_size: Tuple[int, int, int] = (96, 128, 128),
         overlap: float = 0.5,
     ):
+        # Normalize to channel-first layout
+        if volume.ndim == 3:
+            volume = volume[np.newaxis]
+        elif volume.ndim != 4:
+            raise ValueError(
+                f"CZIIInferenceDataset expects (D,H,W) or (C,D,H,W); got {volume.shape}"
+            )
         self.volume = volume
         self.patch_size = patch_size
-        D, H, W = volume.shape
+        _, D, H, W = volume.shape
         pd, ph, pw = patch_size
         sd = max(int(pd * (1 - overlap)), 1)
         sh = max(int(ph * (1 - overlap)), 1)
@@ -654,8 +857,8 @@ class CZIIInferenceDataset(Dataset):
     def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
         z0, y0, x0 = self.origins[idx]
         pd, ph, pw = self.patch_size
-        patch = self.volume[z0:z0 + pd, y0:y0 + ph, x0:x0 + pw]
-        patch_tensor = torch.from_numpy(np.ascontiguousarray(patch)).unsqueeze(0).float()
+        patch = self.volume[:, z0:z0 + pd, y0:y0 + ph, x0:x0 + pw]   # (C, pd, ph, pw)
+        patch_tensor = torch.from_numpy(np.ascontiguousarray(patch)).float()
         origin = torch.tensor([z0, y0, x0], dtype=torch.long)
         return patch_tensor, origin
 

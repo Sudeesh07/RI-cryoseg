@@ -92,34 +92,39 @@ class FocalHeatmapLoss(nn.Module):
         """
         pred:   (B, C, D, H, W) in [0, 1]
         target: (B, C, D, H, W) in [0, 1]
+
+        Computed in fp32 (regardless of AMP context) because the proper
+        CenterNet normalisation by num_pos can amplify the loss by ~17K x
+        on sparse patches and overflow fp16. Casting to fp32 here is cheap
+        but eliminates the GradScaler stall that motivated the earlier
+        loss.mean() workaround. The loss.mean() version underweighted
+        positives by orders of magnitude and is a known suboptimal
+        formulation of focal heatmap loss.
         """
-        eps = 1e-7
-        pred = pred.clamp(eps, 1 - eps)
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            pred = pred.float().clamp(1e-7, 1 - 1e-7)
+            target = target.float()
 
-        # Positive locations: target close to 1
-        pos_mask = target.ge(0.99)
-        pos_loss = -((1 - pred) ** self.alpha) * torch.log(pred)
+            # Positive locations: target close to 1
+            pos_mask = target.ge(0.99)
+            pos_loss = -((1 - pred) ** self.alpha) * torch.log(pred)
 
-        # Negative locations: target < 1
-        neg_loss = (
-            -((1 - target) ** self.gamma)
-            * (pred ** self.alpha)
-            * torch.log(1 - pred)
-        )
+            # Negative locations: target < 1
+            neg_loss = (
+                -((1 - target) ** self.gamma)
+                * (pred ** self.alpha)
+                * torch.log(1 - pred)
+            )
 
-        loss = torch.where(pos_mask, pos_loss, neg_loss)
+            loss = torch.where(pos_mask, pos_loss, neg_loss)
 
-        if self.class_weights is not None:
-            cw = self.class_weights.reshape(1, -1, 1, 1, 1)
-            loss = loss * cw
+            if self.class_weights is not None:
+                cw = self.class_weights.to(loss.dtype).reshape(1, -1, 1, 1, 1)
+                loss = loss * cw
 
-        # Normalise by total voxel count so the loss stays in [0, ~2] regardless
-        # of how many positive voxels exist.  The focal weights still push the
-        # optimiser to focus on hard examples; the absolute scale is just fixed.
-        # Normalising by num_pos alone makes the loss scale with patch fill rate
-        # (~50 positives / 884K voxels = ×17K amplification) which overflows
-        # float16 during AMP backward and stalls GradScaler indefinitely.
-        return loss.mean()
+            num_pos = pos_mask.sum().clamp(min=1).to(loss.dtype)
+            # CenterNet-standard: sum(loss) / num_pos. fp32 keeps this safe.
+            return loss.sum() / num_pos
 
 
 class LearnableZBlurLoss(nn.Module):

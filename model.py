@@ -286,7 +286,10 @@ class LightEquivariantConv(nn.Module):
                 self.radial_mlp[-1].bias.zero_()
 
         # Batch norm
-        self.bn = E3BatchNorm(irreps_out) if use_batch_norm else None
+        # instance=True uses per-sample statistics, which is the correct
+        # choice for 3D segmentation at batch_size=2 (DDP SyncBN is fragile
+        # at this scale). nnU-Net's default for the same reason.
+        self.bn = E3BatchNorm(irreps_out, instance=True) if use_batch_norm else None
 
         # Nonlinearity
         if activation == "gated":
@@ -555,7 +558,10 @@ class SO2EquivariantConv(nn.Module):
         self.z_conv = EquivariantZConv(irreps_out, kernel_size=z_kernel_size)
 
         # Batch norm and activation
-        self.bn = E3BatchNorm(irreps_out) if use_batch_norm else None
+        # instance=True uses per-sample statistics, which is the correct
+        # choice for 3D segmentation at batch_size=2 (DDP SyncBN is fragile
+        # at this scale). nnU-Net's default for the same reason.
+        self.bn = E3BatchNorm(irreps_out, instance=True) if use_batch_norm else None
         if activation == "gated":
             self.activation = GatedNonlinearity(irreps_out)
         elif activation == "norm":
@@ -849,25 +855,74 @@ class SO2EquivariantUNet3D(EquivariantUNet3D):
 # Model Factory
 # ---------------------------------------------------------------------------
 
+class SegResNetWrapper(nn.Module):
+    """MONAI SegResNet + sigmoid head, matching the equivariant model's
+    (B, C, D, H, W) heatmap-in-[0,1] interface.
+
+    This is the Rank-0 integrity-check baseline. The premise is that a
+    standard 3D CNN trained with heavy augmentation (heavy_augmentation=True
+    in DataConfig) will learn approximate equivariance from data and may
+    outperform the hard-coded equivariant model. If it doesn't, equivariance
+    is paying its way; if it does, the equivariant variant is research-only.
+
+    Uses InstanceNorm internally (MONAI's default), matching nnU-Net's
+    convention for small-batch 3D segmentation.
+    """
+
+    def __init__(self, in_channels: int, num_classes: int):
+        super().__init__()
+        try:
+            from monai.networks.nets import SegResNet
+        except ImportError as exc:
+            raise ImportError(
+                "MONAI is required for the SegResNet baseline. "
+                "Install with: pip install 'monai>=1.3.0'"
+            ) from exc
+
+        self.backbone = SegResNet(
+            spatial_dims=3,
+            init_filters=32,
+            in_channels=in_channels,
+            out_channels=num_classes,
+            blocks_down=(1, 2, 2, 4),
+            blocks_up=(1, 1, 1),
+            norm="instance",
+            use_conv_final=True,
+            dropout_prob=0.1,
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(self.backbone(x))
+
+
 def build_model(cfg: ModelConfig, use_equivariant: bool = True) -> nn.Module:
     """
     Build the requested model variant.
 
-    Variant selection (cfg.model_variant):
+    Equivariant variants (cfg.model_variant):
       "so3"       — full SO(3)-equivariant U-Net, isotropic targets
       "so3_aniso" — full SO(3)-equivariant U-Net, anisotropic z targets
       "so2"       — SO(2)-equivariant U-Net,     anisotropic z targets
       "so2_iso"   — SO(2)-equivariant U-Net,     isotropic targets
 
-    The architecture is determined by the prefix ("so3" vs "so2"); the
-    target shape is determined by DataConfig.z_sigma_scale (1.0 isotropic
-    vs 1.5 anisotropic).  The four combinations form a clean 2x2 ablation
-    that disentangles architectural symmetry from target anisotropy.
-
-    use_equivariant=False builds the standard non-equivariant 3D U-Net baseline.
+    use_equivariant=False builds a non-equivariant baseline. cfg.baseline_arch
+    selects between:
+      "segresnet" — MONAI 3D SegResNet (default, recommended for the
+                    rank-0 integrity check; matches CZII top-5 architectures)
+      "unet3d"    — the original plain 3D U-Net (kept for backwards compat)
     """
     if not use_equivariant:
-        return UNet3D(in_channels=cfg.in_channels, num_classes=cfg.num_classes)
+        arch = getattr(cfg, "baseline_arch", "segresnet")
+        if arch == "segresnet":
+            return SegResNetWrapper(
+                in_channels=cfg.in_channels, num_classes=cfg.num_classes,
+            )
+        elif arch == "unet3d":
+            return UNet3D(in_channels=cfg.in_channels, num_classes=cfg.num_classes)
+        else:
+            raise ValueError(
+                f"Unknown baseline_arch '{arch}'. Choose from: segresnet, unet3d"
+            )
 
     variant = getattr(cfg, "model_variant", "so3")
     if variant in ("so3", "so3_aniso"):

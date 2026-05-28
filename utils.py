@@ -141,12 +141,55 @@ def _subvoxel_centroid(
     return float(z_sub), float(y_sub), float(x_sub)
 
 
+def _soft_nms_3d_centroids(
+    coords: np.ndarray,         # (N, 3) integer z, y, x
+    scores: np.ndarray,         # (N,)
+    sigma: float,
+    score_threshold: float,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Gaussian Soft-NMS (Bodla et al. 2017) on already-detected peaks.
+
+    For each peak in score-descending order, decay all lower-scoring peaks'
+    scores by exp(-d^2 / (2 sigma^2)).  Peaks whose decayed score drops below
+    score_threshold are discarded.  Recovers recall on dense scenes
+    (clustered ribosomes, adjacent VLPs) compared to hard NMS which would
+    suppress them entirely.
+    """
+    order = np.argsort(-scores)
+    coords = coords[order].astype(np.float64)
+    scores = scores[order].astype(np.float64)
+
+    kept_coords = []
+    kept_scores = []
+    inv2s2 = 1.0 / (2.0 * sigma * sigma + 1e-12)
+
+    for i in range(len(scores)):
+        if scores[i] < score_threshold:
+            continue
+        kept_coords.append(coords[i])
+        kept_scores.append(scores[i])
+        # Decay all later (lower-scoring) peaks proportional to distance.
+        if i + 1 < len(scores):
+            d2 = np.sum((coords[i + 1:] - coords[i]) ** 2, axis=1)
+            scores[i + 1:] *= np.exp(-d2 * inv2s2)
+
+    if not kept_coords:
+        return np.empty((0, 3), dtype=np.float32), np.empty((0,), dtype=np.float32)
+    return (
+        np.asarray(kept_coords, dtype=np.float32),
+        np.asarray(kept_scores, dtype=np.float32),
+    )
+
+
 def extract_centroids(
     heatmaps: np.ndarray,
     score_thresholds: Dict[str, float],
     nms_kernel: int = 7,
     nms_kernel_sizes: Optional[Dict[str, int]] = None,
     subvoxel: bool = True,
+    use_soft_nms: bool = False,
+    soft_nms_sigma_factor: float = 0.7,
 ) -> Dict[str, np.ndarray]:
     """
     Extract protein centroids from multi-class heatmaps.
@@ -172,19 +215,37 @@ def extract_centroids(
         k = (_nms_kernel_for_class(cls_name, nms_kernel_sizes)
              if nms_kernel_sizes is not None
              else nms_kernel)
-        hm_nms = nms_3d_numpy(hm, kernel_size=k)
-
-        # Threshold
         threshold = score_thresholds.get(cls_name, 0.3)
-        mask = hm_nms > threshold
 
-        if mask.sum() == 0:
-            detections[cls_name] = np.empty((0, 4), dtype=np.float32)
-            continue
-
-        # Integer peak locations
-        coords = np.argwhere(mask)  # (N, 3) — z, y, x
-        scores = hm_nms[mask]
+        if use_soft_nms:
+            # Soft-NMS path: take all peaks > threshold/4 and Gaussian-decay.
+            # Lower pre-threshold lets borderline-close peaks survive after
+            # decay; the final cut is applied inside _soft_nms_3d_centroids.
+            prelim_mask = hm > (threshold / 4.0)
+            if prelim_mask.sum() == 0:
+                detections[cls_name] = np.empty((0, 4), dtype=np.float32)
+                continue
+            prelim_coords = np.argwhere(prelim_mask)
+            prelim_scores = hm[prelim_mask]
+            cls_id = PROTEIN_CLASSES[cls_name]["id"]
+            radius = CLASS_RADII_VOXELS[cls_id]
+            sigma_nms = max(1.0, soft_nms_sigma_factor * radius)
+            coords, scores = _soft_nms_3d_centroids(
+                prelim_coords, prelim_scores,
+                sigma=sigma_nms, score_threshold=threshold,
+            )
+            if len(coords) == 0:
+                detections[cls_name] = np.empty((0, 4), dtype=np.float32)
+                continue
+            coords = coords.astype(np.int64)
+        else:
+            hm_nms = nms_3d_numpy(hm, kernel_size=k)
+            mask = hm_nms > threshold
+            if mask.sum() == 0:
+                detections[cls_name] = np.empty((0, 4), dtype=np.float32)
+                continue
+            coords = np.argwhere(mask)        # (N, 3) — z, y, x
+            scores = hm_nms[mask]
 
         if subvoxel:
             # Window scales with class sigma; capped at half the NMS kernel
