@@ -125,6 +125,14 @@ class DataConfig:
     # Typical missing-wedge elongation factor: 1.5–2.0 at ±60° tilt range.
     z_sigma_scale: float = 1.5
 
+    # Target mode controls what the dataloader emits:
+    #   "blur"     : standard, fully-blurred Gaussian heatmaps (default).
+    #   "xy_blur"  : xy-blurred only; the z-direction Gaussian is applied
+    #                in the loss with a learnable per-class sigma_z.  Used
+    #                with TrainConfig.learnable_z_sigma=True so that the
+    #                anisotropy is inferred from data rather than hard-coded.
+    target_mode: str = "blur"
+
     # Normalization
     clip_percentile: Tuple[float, float] = (0.5, 99.5)
     normalize: bool = True
@@ -169,10 +177,13 @@ class ModelConfig:
     pool_type: str = "avg"              # "avg" only (max-pool breaks equivariance)
 
     # Architecture variant — controls which symmetry group is enforced:
-    #   "so3"       : full SO(3) equivariance, isotropic kernel (default)
-    #   "so3_aniso" : full SO(3) equivariance + anisotropic z heatmap targets
+    #   "so3"       : full SO(3) equivariance, isotropic targets (default)
+    #   "so3_aniso" : full SO(3) equivariance + anisotropic z targets
     #   "so2"       : SO(2) equivariance (z-axis only) + anisotropic z targets
-    # "so3_aniso" and "so2" both require z_sigma_scale > 1.0 in DataConfig.
+    #   "so2_iso"   : SO(2) equivariance + isotropic targets
+    # The "_aniso" / "_iso" suffix sets z_sigma_scale in train.py.
+    # The four variants form a 2x2 ablation: architecture (SO3/SO2) x
+    # targets (iso/aniso), letting you separate the two factors.
     model_variant: str = "so3"
 
 
@@ -192,6 +203,16 @@ class TrainConfig:
     wmse_alpha: float = 0.1             # background weight in weighted MSE
     loss_class_weights: bool = True
 
+    # If True, the loss applies a differentiable z-direction Gaussian blur
+    # to xy-only-blurred targets with a per-class learnable sigma_z.
+    # Requires DataConfig.target_mode == "xy_blur".
+    # Lets the network learn the missing-wedge anisotropy per protein class
+    # instead of using a single hard-coded z_sigma_scale.
+    learnable_z_sigma: bool = False
+    learnable_z_sigma_init: float = 1.5     # initial sigma_z / sigma_xy ratio
+    learnable_z_sigma_min: float = 0.5      # clamp lower bound (per axis)
+    learnable_z_sigma_max: float = 4.0      # clamp upper bound
+
     use_amp: bool = True
 
     checkpoint_dir: str = "./checkpoints"
@@ -200,6 +221,15 @@ class TrainConfig:
 
     val_every: int = 5
     val_patch_overlap: float = 0.25
+
+    # Full-volume validation: runs sliding-window inference on each val run
+    # and computes F-beta from the merged centroids — matches real inference
+    # behaviour (no positive-patch bias).  Expensive (~1-2 min per run on H100),
+    # so by default it only runs every full_volume_val_every epochs.
+    # Set to 0 to disable.
+    full_volume_val_every: int = 20
+    full_volume_val_batch_size: int = 4
+    full_volume_val_overlap: float = 0.5
 
     seed: int = 42
     num_workers: int = 4

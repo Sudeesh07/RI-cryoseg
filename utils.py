@@ -11,8 +11,8 @@ from scipy.ndimage import label as scipy_label
 from scipy.ndimage import maximum_filter
 
 from config import (
-    CLASS_NAMES, CLASS_RADII_VOXELS, CLASS_WEIGHTS, NUM_CLASSES,
-    PROTEIN_CLASSES,
+    CLASS_NAMES, CLASS_RADII_VOXELS, CLASS_SIGMAS_VOXELS, CLASS_WEIGHTS,
+    NUM_CLASSES, PROTEIN_CLASSES,
 )
 
 
@@ -79,6 +79,24 @@ def _nms_kernel_for_class(cls_name: str, nms_kernel_sizes: Optional[Dict[str, in
     return max(3, 2 * int(radius) + 1)
 
 
+def _subvoxel_radius_for_class(cls_name: str, max_radius: Optional[int] = None) -> int:
+    """
+    Pick a sub-voxel refinement neighbourhood that scales with the class
+    Gaussian sigma.  A fixed radius=2 (used previously) is too small for
+    ribosome-scale particles (sigma ≈ 6 vox) — the centre-of-mass loses
+    most of the Gaussian mass.  We use ceil(2 * sigma), which captures
+    ~95% of the mass on each axis.  Capped at max_radius so the window
+    never exceeds the NMS half-kernel (otherwise it can pull in a nearby
+    peak's mass).
+    """
+    cls_id = PROTEIN_CLASSES[cls_name]["id"]
+    sigma = CLASS_SIGMAS_VOXELS[cls_id]
+    r = max(2, int(np.ceil(2.0 * sigma)))
+    if max_radius is not None:
+        r = min(r, max_radius)
+    return r
+
+
 def _subvoxel_centroid(
     hm: np.ndarray,
     z: int,
@@ -96,7 +114,9 @@ def _subvoxel_centroid(
     Args:
         hm:     (D, H, W) heatmap channel
         z,y,x:  integer peak coordinates
-        radius: neighbourhood half-width
+        radius: neighbourhood half-width — for centroid recovery to be
+                accurate it should scale with the Gaussian sigma of the
+                target class (see _subvoxel_radius_for_class).
 
     Returns:
         (z_sub, y_sub, x_sub) subvoxel coordinates
@@ -167,9 +187,14 @@ def extract_centroids(
         scores = hm_nms[mask]
 
         if subvoxel:
+            # Window scales with class sigma; capped at half the NMS kernel
+            # so it cannot reach the next suppressed peak.
+            sub_r = _subvoxel_radius_for_class(cls_name, max_radius=k // 2)
             refined = []
             for (z, y, x), s in zip(coords, scores):
-                zs, ys, xs = _subvoxel_centroid(hm, int(z), int(y), int(x))
+                zs, ys, xs = _subvoxel_centroid(
+                    hm, int(z), int(y), int(x), radius=sub_r,
+                )
                 refined.append([zs, ys, xs, float(s)])
             det = np.array(refined, dtype=np.float32)
         else:

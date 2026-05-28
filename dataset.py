@@ -268,6 +268,7 @@ def generate_gaussian_heatmap(
     sigma: float = 4.0,
     sigma_z: Optional[float] = None,
     truncate: float = 3.0,
+    xy_only: bool = False,
 ) -> np.ndarray:
     """
     Generate a 3D Gaussian heatmap with peaks at the given centroids.
@@ -280,6 +281,9 @@ def generate_gaussian_heatmap(
         sigma:   in-plane (H, W) Gaussian sigma in voxels.
         sigma_z: axial (D) Gaussian sigma.  Pass a value > sigma to model the
                  missing-wedge PSF elongation along z.  None = isotropic.
+        xy_only: if True, only blur along (y, x) — leave z as impulses.
+                 The z-direction Gaussian is then applied in the loss with a
+                 learnable per-class sigma_z (see TrainConfig.learnable_z_sigma).
 
     Returns (D, H, W) float32 array in [0, 1].
     """
@@ -293,14 +297,30 @@ def generate_gaussian_heatmap(
         if 0 <= z < D and 0 <= y < H and 0 <= x < W:
             heatmap[z, y, x] += 1.0   # additive for overlapping particles
 
-    # Apply Gaussian filter — anisotropic if sigma_z provided
-    sz = sigma_z if sigma_z is not None else sigma
-    heatmap = gaussian_filter(heatmap, sigma=[sz, sigma, sigma], truncate=truncate)
+    if xy_only:
+        # Blur only along (y, x); leave z untouched so the loss can apply a
+        # learnable z-direction Gaussian. sigma=0 on axis 0 is a no-op.
+        heatmap = gaussian_filter(
+            heatmap, sigma=[0.0, sigma, sigma], truncate=truncate,
+        )
+        # Normalise so an isolated centroid peaks at 1.0 along the xy plane.
+        # The peak of an xy-only blur of a unit impulse equals the 2D peak.
+        size = max(int(2 * truncate * sigma) * 2 + 1, 7)
+        impulse2d = np.zeros((size, size), dtype=np.float64)
+        impulse2d[size // 2, size // 2] = 1.0
+        peak2d = float(gaussian_filter(impulse2d, sigma=sigma, truncate=truncate)[size // 2, size // 2])
+        if peak2d > 0:
+            heatmap /= peak2d
+    else:
+        # Apply Gaussian filter — anisotropic if sigma_z provided
+        sz = sigma_z if sigma_z is not None else sigma
+        heatmap = gaussian_filter(heatmap, sigma=[sz, sigma, sigma], truncate=truncate)
 
-    # Normalise: divide by the peak value of a single isolated Gaussian
-    norm = _get_norm_factor(sigma, sigma_z=sigma_z, truncate=truncate)
-    if norm > 0:
-        heatmap /= norm
+        # Normalise: divide by the peak value of a single isolated Gaussian
+        norm = _get_norm_factor(sigma, sigma_z=sigma_z, truncate=truncate)
+        if norm > 0:
+            heatmap /= norm
+
     # Clip overlapping particle regions at 1.0
     heatmap = np.clip(heatmap, 0.0, 1.0)
 
@@ -313,6 +333,7 @@ def generate_multiclass_heatmap(
     sigma_per_class: Optional[List[float]] = None,
     z_sigma_scale: float = 1.0,
     truncate: float = 3.0,
+    xy_only: bool = False,
 ) -> np.ndarray:
     """
     Generate a (C, D, H, W) multi-channel Gaussian heatmap.
@@ -324,6 +345,9 @@ def generate_multiclass_heatmap(
         1.0 = isotropic targets (so3 variant).
         1.5 = z-elongated targets (so3_aniso / so2 variants) to match the
               anisotropic PSF caused by the missing wedge in cryo-ET.
+
+    xy_only: if True, blur only along (y, x).  z-blur is then applied in the
+        loss with a learnable per-class sigma_z.  Ignores z_sigma_scale.
     """
     sigmas = sigma_per_class if sigma_per_class is not None else CLASS_SIGMAS_VOXELS
     heatmaps = np.zeros((NUM_CLASSES, *volume_shape), dtype=np.float32)
@@ -337,6 +361,7 @@ def generate_multiclass_heatmap(
         heatmaps[cls_id] = generate_gaussian_heatmap(
             volume_shape, centroids,
             sigma=sigma, sigma_z=sigma_z, truncate=truncate,
+            xy_only=xy_only,
         )
     return heatmaps
 
@@ -533,11 +558,15 @@ class CZIIDataset(Dataset):
                                       dtype=np.float32)
             local_annot[cls_name] = local
 
-        # Generate heatmap for expanded region then crop to patch
+        # Generate heatmap for expanded region then crop to patch.
+        # target_mode == "xy_blur" emits xy-only blurred targets so the loss
+        # can apply a learnable z-direction Gaussian (see losses.LearnableZBlurLoss).
+        xy_only = getattr(self.cfg, "target_mode", "blur") == "xy_blur"
         hm_expanded = generate_multiclass_heatmap(
             expanded, local_annot,
             z_sigma_scale=self.cfg.z_sigma_scale,
             truncate=self.cfg.gaussian_truncate,
+            xy_only=xy_only,
         )
         return hm_expanded[:, border:border + pd, border:border + ph, border:border + pw]
 

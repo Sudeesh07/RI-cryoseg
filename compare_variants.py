@@ -1,23 +1,32 @@
 """
-Compare three trained model variants on the validation set.
+Compare four trained model variants on the validation set.
 
 Loads the best.pt checkpoint for each variant and evaluates on TS_99_9
 (the reserved validation run).  Prints a per-class and overall F-beta
 comparison table and writes results to compare_results.json.
 
-Usage (after training all three variants):
+The four variants form a 2x2 ablation that disentangles architecture
+(SO3 vs SO2) from target shape (isotropic vs anisotropic z):
+
+                       targets iso   |   targets aniso
+    SO(3) arch  :        so3         |     so3_aniso
+    SO(2) arch  :        so2_iso     |     so2
+
+Reading the table:
+  so3 vs so2_iso        : architecture effect with isotropic targets
+  so3_aniso vs so2      : architecture effect with anisotropic targets
+  so3 vs so3_aniso      : target effect inside SO(3)
+  so2_iso vs so2        : target effect inside SO(2)
+
+Usage (after training all four variants):
     python compare_variants.py
 
 Or point to specific checkpoints:
     python compare_variants.py \\
         --so3       ./checkpoints/so3/best.pt \\
         --so3_aniso ./checkpoints/so3_aniso/best.pt \\
-        --so2       ./checkpoints/so2/best.pt
-
-Variants explained:
-    so3       : SO(3)-equivariant, isotropic Gaussian targets
-    so3_aniso : SO(3)-equivariant, anisotropic z targets (Fix 1 only)
-    so2       : SO(2)-equivariant, anisotropic z targets (Fix 1 + Fix 3)
+        --so2       ./checkpoints/so2/best.pt \\
+        --so2_iso   ./checkpoints/so2_iso/best.pt
 """
 
 import argparse
@@ -55,6 +64,11 @@ VARIANT_SPECS = {
         "model_variant": "so2",
         "z_sigma_scale": 1.5,
         "label": "SO(2)-equivariant  (aniso z targets)",
+    },
+    "so2_iso": {
+        "model_variant": "so2_iso",
+        "z_sigma_scale": 1.0,
+        "label": "SO(2)-equivariant  (isotropic targets)",
     },
 }
 
@@ -191,6 +205,8 @@ def main():
                         help="Path to so3_aniso best.pt")
     parser.add_argument("--so2",       default=None,
                         help="Path to so2 best.pt")
+    parser.add_argument("--so2_iso",   default=None,
+                        help="Path to so2_iso best.pt")
     parser.add_argument("--dataset",   default="./dataset/10440")
     parser.add_argument("--output",    default="compare_results.json")
     parser.add_argument("--device",    default=None,
@@ -207,6 +223,7 @@ def main():
         "so3":       args.so3       or "checkpoints/so3/best.pt",
         "so3_aniso": args.so3_aniso or "checkpoints/so3_aniso/best.pt",
         "so2":       args.so2       or "checkpoints/so2/best.pt",
+        "so2_iso":   args.so2_iso   or "checkpoints/so2_iso/best.pt",
     }
 
     # Load available checkpoints (skip missing ones)

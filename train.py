@@ -1,15 +1,18 @@
 """
 Training Pipeline for SO(3)/SO(2)-Equivariant Protein Centroid Detection.
 
-Supports three model variants (--model-variant):
-  so3       — full SO(3)-equivariant U-Net, isotropic heatmap targets
-  so3_aniso — full SO(3)-equivariant U-Net, anisotropic z heatmap targets
-  so2       — SO(2)-equivariant U-Net,      anisotropic z heatmap targets
+Supports four model variants (--model-variant) — a 2x2 ablation of
+architecture (so3 / so2) x targets (iso / aniso):
+  so3       — SO(3)-equivariant U-Net, isotropic heatmap targets
+  so3_aniso — SO(3)-equivariant U-Net, anisotropic z heatmap targets
+  so2       — SO(2)-equivariant U-Net, anisotropic z heatmap targets
+  so2_iso   — SO(2)-equivariant U-Net, isotropic heatmap targets
 
 Multi-GPU (2 GPUs):
   torchrun --nproc_per_node=2 train.py --model-variant so3
   torchrun --nproc_per_node=2 train.py --model-variant so3_aniso
   torchrun --nproc_per_node=2 train.py --model-variant so2
+  torchrun --nproc_per_node=2 train.py --model-variant so2_iso
 
 Single-GPU:
   python train.py --model-variant so3
@@ -25,6 +28,7 @@ import time
 import argparse
 import random
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -35,14 +39,23 @@ from torch.amp import GradScaler, autocast
 from torch.utils.tensorboard import SummaryWriter
 
 from config import Config, TrainConfig
-from dataset import build_dataloaders
+from dataset import (
+    build_dataloaders,
+    load_tomogram, normalize_tomogram, get_tomogram_path,
+    load_run_annotations, discover_run_names,
+    CZIIInferenceDataset,
+)
+from torch.utils.data import DataLoader
 from model import build_model
-from losses import build_loss
+from losses import build_loss, LearnableZBlurLoss
 from utils import (
+    aggregate_predictions,
     extract_centroids,
+    compute_fbeta_per_class,
     compute_weighted_fbeta,
     nms_3d,
     CLASS_NAMES,
+    NUM_CLASSES,
     PROTEIN_CLASSES,
 )
 
@@ -104,8 +117,18 @@ def set_seed(seed: int, rank: int = 0):
 # Optimizer / Scheduler
 # ---------------------------------------------------------------------------
 
-def build_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer:
-    """AdamW with weight decay skipped for bias / norm parameters."""
+def build_optimizer(
+    model: nn.Module,
+    cfg: TrainConfig,
+    extra_modules: Optional[list] = None,
+) -> torch.optim.Optimizer:
+    """AdamW with weight decay skipped for bias / norm parameters.
+
+    extra_modules: optional list of nn.Modules whose parameters should also
+    be optimised (e.g. a loss with learnable per-class sigma_z).  These
+    parameters get weight_decay=0 because they are interpretable scalars,
+    not feature weights.
+    """
     decay, no_decay = [], []
     for name, param in model.named_parameters():
         if not param.requires_grad:
@@ -114,9 +137,18 @@ def build_optimizer(model: nn.Module, cfg: TrainConfig) -> torch.optim.Optimizer
             no_decay.append(param)
         else:
             decay.append(param)
+
+    extra_params: list = []
+    if extra_modules:
+        for m in extra_modules:
+            for p in m.parameters():
+                if p.requires_grad:
+                    extra_params.append(p)
+
     return torch.optim.AdamW([
-        {"params": decay,    "weight_decay": cfg.weight_decay},
-        {"params": no_decay, "weight_decay": 0.0},
+        {"params": decay,        "weight_decay": cfg.weight_decay},
+        {"params": no_decay,     "weight_decay": 0.0},
+        {"params": extra_params, "weight_decay": 0.0},
     ], lr=cfg.learning_rate)
 
 
@@ -254,6 +286,119 @@ def validate(
 
 
 # ---------------------------------------------------------------------------
+# Full-volume validation
+# ---------------------------------------------------------------------------
+
+@torch.no_grad()
+def validate_full_volume(
+    model,
+    dataset_dir: str,
+    run_names,
+    data_cfg,
+    inference_cfg,
+    device,
+    use_amp: bool,
+    batch_size: int = 4,
+    overlap: float = 0.5,
+) -> dict:
+    """
+    Run sliding-window inference on each full validation tomogram and compute
+    F-beta on the aggregated centroids.
+
+    This matches deployment behaviour (no positive-patch bias, no patch-cut
+    artefacts), unlike the patch-level validate() function whose patches are
+    drawn uniformly at random from a distribution that does not match training.
+
+    Returns: {
+        "full_val_fbeta":       weighted overall F-beta across all val runs,
+        "full_val_fbeta_per_class": dict[class -> F-beta],
+        "full_val_runs":        list of run names actually scored,
+    }
+    """
+    model.eval()
+
+    inner_model = model.module if isinstance(model, DDP) else model
+
+    score_thresholds = inference_cfg.score_thresholds
+    nms_kernel_sizes = inference_cfg.nms_kernel_sizes
+    fbeta_beta = inference_cfg.fbeta_beta
+    distance_scale = inference_cfg.distance_threshold_scale
+
+    merged_pred = {c: [] for c in CLASS_NAMES}
+    merged_gt   = {c: [] for c in CLASS_NAMES}
+    actual_runs = []
+
+    for run_name in run_names:
+        try:
+            tomo_path = get_tomogram_path(dataset_dir, run_name, data_cfg.voxel_spacing_dir)
+        except FileNotFoundError:
+            continue
+        volume = load_tomogram(tomo_path)
+        if data_cfg.normalize:
+            volume = normalize_tomogram(volume, data_cfg.clip_percentile)
+
+        ds = CZIIInferenceDataset(
+            volume,
+            patch_size=inference_cfg.patch_size,
+            overlap=overlap,
+        )
+        loader = DataLoader(
+            ds, batch_size=batch_size, shuffle=False,
+            num_workers=0, pin_memory=torch.cuda.is_available(),
+        )
+
+        patch_preds = []
+        for patches, origins in loader:
+            patches = patches.to(device, non_blocking=True)
+            with autocast("cuda", enabled=use_amp):
+                preds = inner_model(patches)
+            preds = preds.float().cpu()
+            for i in range(preds.shape[0]):
+                origin = tuple(origins[i].numpy().tolist())
+                patch_preds.append((preds[i].numpy(), origin))
+
+        full_heatmap = aggregate_predictions(
+            patch_preds, volume_shape=volume.shape, num_classes=NUM_CLASSES,
+        )
+
+        pred_dets = extract_centroids(
+            full_heatmap, score_thresholds, nms_kernel_sizes=nms_kernel_sizes,
+        )
+        gt_dict = load_run_annotations(
+            os.path.join(dataset_dir, run_name), data_cfg.voxel_spacing_dir,
+        )
+
+        for c in CLASS_NAMES:
+            if len(pred_dets[c]) > 0:
+                merged_pred[c].append(pred_dets[c][:, :3])
+            if c in gt_dict and len(gt_dict[c]) > 0:
+                merged_gt[c].append(gt_dict[c])
+        actual_runs.append(run_name)
+
+    merged_pred = {
+        c: np.concatenate(merged_pred[c], axis=0) if merged_pred[c] else np.empty((0, 3))
+        for c in CLASS_NAMES
+    }
+    merged_gt = {
+        c: np.concatenate(merged_gt[c], axis=0) if merged_gt[c] else np.empty((0, 3))
+        for c in CLASS_NAMES
+    }
+
+    per_class = compute_fbeta_per_class(
+        merged_pred, merged_gt, beta=fbeta_beta, distance_scale=distance_scale,
+    )
+    overall = compute_weighted_fbeta(
+        merged_pred, merged_gt, beta=fbeta_beta, distance_scale=distance_scale,
+    )
+
+    return {
+        "full_val_fbeta":           overall,
+        "full_val_fbeta_per_class": per_class,
+        "full_val_runs":            actual_runs,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Checkpointing
 # ---------------------------------------------------------------------------
 
@@ -300,14 +445,22 @@ def main():
     parser.add_argument("--baseline",      action="store_true",
                         help="Use standard (non-equivariant) U-Net baseline")
     parser.add_argument(
+        "--learnable-z-sigma", action="store_true",
+        help=(
+            "Use per-class learnable sigma_z applied inside the loss "
+            "(targets are xy-only-blurred). Overrides z_sigma_scale."
+        ),
+    )
+    parser.add_argument(
         "--model-variant",
         type=str,
         default=None,
-        choices=["so3", "so3_aniso", "so2"],
+        choices=["so3", "so3_aniso", "so2", "so2_iso"],
         help=(
             "so3: SO(3)-equivariant, isotropic targets (default). "
             "so3_aniso: SO(3)-equivariant, anisotropic z targets. "
-            "so2: SO(2)-equivariant, anisotropic z targets."
+            "so2: SO(2)-equivariant, anisotropic z targets. "
+            "so2_iso: SO(2)-equivariant, isotropic targets."
         ),
     )
     args = parser.parse_args()
@@ -324,23 +477,47 @@ def main():
     if args.lr:
         cfg.train.learning_rate = args.lr
 
-    # Apply model variant — also controls z_sigma_scale for anisotropic targets
+    # Apply model variant — also controls z_sigma_scale for anisotropic targets.
+    # The 2x2 ablation: architecture (so3 / so2) x targets (iso / aniso).
     variant = args.model_variant or ("baseline" if args.baseline else "so3")
     if not args.baseline:
         cfg.model.model_variant = variant
     if variant in ("so3_aniso", "so2"):
-        cfg.data.z_sigma_scale = 1.5   # anisotropic heatmap targets
+        cfg.data.z_sigma_scale = 1.5   # anisotropic z heatmap targets
     else:
-        cfg.data.z_sigma_scale = 1.0   # isotropic heatmap targets
+        # "so3" and "so2_iso" both use isotropic targets
+        cfg.data.z_sigma_scale = 1.0
+
+    # Learnable per-class sigma_z overrides the static z_sigma_scale.
+    # Dataloader emits xy-only-blurred targets; the loss applies a
+    # differentiable z-Gaussian with a learnable per-class sigma.
+    if args.learnable_z_sigma:
+        cfg.train.learnable_z_sigma = True
+        cfg.data.target_mode = "xy_blur"
+        # Tag the run so checkpoints/logs don't collide with the static variant.
+        variant = f"{variant}_lz"
 
     train_cfg = cfg.train
     set_seed(train_cfg.seed, rank)
 
-    # Checkpoint and log dirs are variant-specific so all three can coexist
-    ckpt_base  = Path(train_cfg.checkpoint_dir) / variant
-    log_base   = Path(train_cfg.log_dir) / variant
+    # Checkpoint and log dirs are variant-specific so all variants coexist.
+    # train_kfold.py overrides these via CZII_CKPT_DIR / CZII_LOG_DIR so each
+    # fold gets its own subdirectory; otherwise default to ./{base}/{variant}/.
+    ckpt_override = os.environ.get("CZII_CKPT_DIR")
+    log_override  = os.environ.get("CZII_LOG_DIR")
+    ckpt_base = Path(ckpt_override) if ckpt_override else Path(train_cfg.checkpoint_dir) / variant
+    log_base  = Path(log_override)  if log_override  else Path(train_cfg.log_dir) / variant
     cfg.train.checkpoint_dir = str(ckpt_base)
     cfg.train.log_dir        = str(log_base)
+
+    # train_kfold.py communicates the held-out run(s) via CZII_VAL_RUN.
+    val_run_env = os.environ.get("CZII_VAL_RUN")
+    if val_run_env:
+        cfg.data.val_run_names = tuple(
+            r.strip() for r in val_run_env.split(",") if r.strip()
+        )
+        if is_main(rank):
+            print(f"  (fold override) val_run_names = {cfg.data.val_run_names}")
 
     # Device
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
@@ -372,9 +549,12 @@ def main():
         n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
         print(f"Trainable parameters: {n_params:,}")
 
-    # Loss, optimizer, scheduler, scaler
+    # Loss, optimizer, scheduler, scaler.  When learnable_z_sigma is on,
+    # the criterion owns parameters (per-class log_z_scale) that must be
+    # registered with the optimizer; pass it as extra_modules.
     criterion = build_loss(train_cfg).to(device)
-    optimizer = build_optimizer(model, train_cfg)
+    extra_loss_modules = [criterion] if train_cfg.learnable_z_sigma else None
+    optimizer = build_optimizer(model, train_cfg, extra_modules=extra_loss_modules)
     scheduler = build_scheduler(optimizer, train_cfg, len(train_loader))
     scaler    = GradScaler("cuda", enabled=train_cfg.use_amp)
 
@@ -412,6 +592,15 @@ def main():
             writer.add_scalar("train/loss",      train_metrics["train_loss"],      epoch)
             writer.add_scalar("train/grad_norm", train_metrics["train_grad_norm"], epoch)
             writer.add_scalar("train/lr",        optimizer.param_groups[0]["lr"],  epoch)
+            # Log per-class learned z_scale when active so we can watch
+            # the missing-wedge anisotropy emerge during training.
+            if train_cfg.learnable_z_sigma and isinstance(criterion, LearnableZBlurLoss):
+                with torch.no_grad():
+                    z_scales = criterion.current_z_scales().detach().cpu().tolist()
+                for cls_name, z in zip(CLASS_NAMES, z_scales):
+                    writer.add_scalar(
+                        f"learnable_z_sigma/{cls_name}", float(z), epoch,
+                    )
 
         # Validate (only main process; val_loader has no sampler)
         val_metrics = {}
@@ -434,6 +623,45 @@ def main():
                         {**train_metrics, **val_metrics},
                         os.path.join(str(ckpt_base), "best.pt"),
                     )
+
+        # Full-volume validation — sliding-window inference on each val run,
+        # F-beta on aggregated centroids.  Matches deployment behaviour.
+        # Rank 0 only because it does I/O and would otherwise duplicate work.
+        fv_every = getattr(train_cfg, "full_volume_val_every", 0)
+        if (is_main(rank) and val_loader is not None and fv_every > 0
+                and (epoch + 1) % fv_every == 0):
+            val_runs = list(cfg.data.val_run_names)
+            t_fv = time.time()
+            fv_metrics = validate_full_volume(
+                model,
+                dataset_dir=cfg.data.dataset_dir,
+                run_names=val_runs,
+                data_cfg=cfg.data,
+                inference_cfg=cfg.inference,
+                device=device,
+                use_amp=train_cfg.use_amp,
+                batch_size=train_cfg.full_volume_val_batch_size,
+                overlap=train_cfg.full_volume_val_overlap,
+            )
+            fv_elapsed = time.time() - t_fv
+            print(
+                f"  Full-volume val on {fv_metrics['full_val_runs']}: "
+                f"F-beta={fv_metrics['full_val_fbeta']:.4f} "
+                f"({fv_elapsed:.1f}s)"
+            )
+            if writer:
+                writer.add_scalar("val_full/fbeta", fv_metrics["full_val_fbeta"], epoch)
+                for c, fb in fv_metrics["full_val_fbeta_per_class"].items():
+                    writer.add_scalar(f"val_full/fbeta_{c}", float(fb), epoch)
+            # Track best by full-volume F-beta so checkpoint selection matches
+            # deployment metric, not the biased patch-level F-beta.
+            if fv_metrics["full_val_fbeta"] > best_fbeta:
+                best_fbeta = fv_metrics["full_val_fbeta"]
+                save_checkpoint(
+                    model, optimizer, scheduler, scaler, epoch,
+                    {**train_metrics, **val_metrics, **fv_metrics},
+                    os.path.join(str(ckpt_base), "best.pt"),
+                )
 
         # Periodic checkpoint — rank 0 only
         if is_main(rank) and (epoch + 1) % train_cfg.save_every == 0:

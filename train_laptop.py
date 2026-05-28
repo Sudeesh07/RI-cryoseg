@@ -77,6 +77,7 @@ def make_laptop_config(variant: str) -> Config:
     # Smaller patches — fits 6 GB VRAM with batch=2 and AMP
     cfg.data.patch_size = (64, 64, 64)
     cfg.data.patches_per_tomo = 32  # fewer patches → faster epoch
+    # 2x2 ablation: z_sigma_scale tracks the target shape, not the architecture
     cfg.data.z_sigma_scale = 1.5 if variant in ("so3_aniso", "so2") else 1.0
 
     # Training
@@ -214,7 +215,7 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, metrics, path):
 def main():
     parser = argparse.ArgumentParser(description="Laptop-scale training")
     parser.add_argument("--model-variant", default="so3",
-                        choices=["so3", "so3_aniso", "so2"])
+                        choices=["so3", "so3_aniso", "so2", "so2_iso"])
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--resume", type=str, default=None)
     args = parser.parse_args()
